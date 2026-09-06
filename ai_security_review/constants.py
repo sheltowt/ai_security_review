@@ -40,6 +40,23 @@ REFUSAL_FALLBACK_BETA = "server-side-fallback-2026-07-01"
 CLAUDE_CODE_TIMEOUT_SECONDS = int(os.environ.get("AI_SECURITY_REVIEW_CLAUDE_CODE_TIMEOUT", "1200"))
 CLAUDE_CODE_ALLOWED_TOOLS = "Read,Glob,Grep,LS,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
 
+# External open-source scanners. They run before triage; missing binaries are skipped, never fatal.
+TOOL_GITLEAKS = "gitleaks"
+TOOL_SEMGREP = "semgrep"
+ALL_TOOLS = (TOOL_GITLEAKS, TOOL_SEMGREP)
+DEFAULT_TOOLS = tuple(
+    t.strip().lower() for t in (os.environ.get("AI_SECURITY_REVIEW_TOOLS") or "gitleaks,semgrep").split(",") if t.strip()
+)
+TOOL_TIMEOUT_SECONDS = int(os.environ.get("AI_SECURITY_REVIEW_TOOL_TIMEOUT", "300"))
+SEMGREP_CONFIG = os.environ.get("AI_SECURITY_REVIEW_SEMGREP_CONFIG") or "p/default"
+GITLEAKS_CONFIG = os.environ.get("AI_SECURITY_REVIEW_GITLEAKS_CONFIG") or None
+# Confidence assigned to deterministic secret hits. Above the default finding threshold so they report
+# without model confirmation; a model cannot verify a credential anyway.
+SECRET_FINDING_CONFIDENCE = 0.85
+SECRET_IN_HISTORY_CONFIDENCE = 0.8
+# Confidence a SAST candidate receives once a scan confirms it.
+CONFIRMED_CANDIDATE_CONFIDENCE = 0.85
+
 # Size limits
 MAX_DIFF_CHARS = 400_000         # above this the diff is truncated per file for the API backend
 MAX_CONTEXT_FILE_CHARS = 60_000  # per file when attaching touched-file contents

@@ -9,10 +9,13 @@ SEVERITY_ICON = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}
 
 def finding_comment_body(f: Dict[str, Any]) -> str:
     scans = ", ".join(f.get("scans") or [f.get("scan", "")])
+    meta = f"**Category:** `{f['category']}` · **Found by:** {scans} · **Confidence:** {f['confidence']:.2f}"
+    if f.get("rule_id"):
+        meta += f" · **Rule:** `{f['rule_id']}`"
     lines = [
         f"**{SEVERITY_ICON.get(f['severity'], '')} {f['severity']}: {f['title']}**",
         "",
-        f"**Category:** `{f['category']}` · **Scan:** {scans} · **Confidence:** {f['confidence']:.2f}",
+        meta,
         "",
         f["description"],
     ]
@@ -20,7 +23,7 @@ def finding_comment_body(f: Dict[str, Any]) -> str:
         lines += ["", f"**Exploit scenario:** {f['exploit_scenario']}"]
     if f.get("recommendation"):
         lines += ["", f"**Recommendation:** {f['recommendation']}"]
-    if not f.get("introduced_by_change", True):
+    if not f.get("introduced_by_change", True) and f.get("category") != "secret_in_history":
         lines += ["", "_Pre-existing code made newly reachable by this change._"]
     return "\n".join(lines)
 
@@ -54,6 +57,15 @@ def render_markdown_summary(result: Dict[str, Any]) -> str:
         out.append(f"| {SCAN_DEFINITIONS[key].title} | {mark} | {float(entry.get('confidence', 0)):.2f} | {reason} |")
     out.append("")
 
+    tools = result.get("tool_results") or []
+    if tools:
+        out += ["### Scanners", "", "| Tool | Status | Version | Findings | Candidates | Notes |", "|---|---|---|---|---|---|"]
+        for t in tools:
+            status = {"completed": "✅ ran", "skipped": "— skipped", "failed": "❌ failed"}.get(t.get("status"), t.get("status", ""))
+            note = str(t.get("error") or t.get("notes") or "").replace("|", "\\|")[:160]
+            out.append(f"| {t.get('tool')} | {status} | {t.get('version') or ''} | {t.get('findings_count', 0)} | {t.get('candidates_count', 0)} | {note} |")
+        out.append("")
+
     out += ["### Findings", ""]
     if not findings:
         if triage.get("selected_scans"):
@@ -76,6 +88,11 @@ def render_markdown_summary(result: Dict[str, Any]) -> str:
     footer_bits = []
     if filt.get("total"):
         footer_bits.append(f"{filt['total']} raw finding(s) reviewed, {filt.get('kept', 0)} kept after filtering")
+    if filt.get("candidates_total"):
+        footer_bits.append(
+            f"{filt['candidates_total']} scanner candidate(s): {filt.get('candidates_confirmed', 0)} confirmed, "
+            f"{filt.get('candidates_dismissed', 0)} dismissed, {filt.get('candidates_unverified', 0)} unverified"
+        )
     if failed:
         footer_bits.append("failed scans: " + ", ".join(f"{s['scan']} ({s.get('error', '')[:80]})" for s in failed))
     usage = result.get("usage") or {}

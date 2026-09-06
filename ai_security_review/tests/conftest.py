@@ -49,6 +49,17 @@ index 7777777..8888888 100644
 """
 
 
+@pytest.fixture(autouse=True)
+def no_external_tools(request, monkeypatch):
+    """Keep gitleaks/semgrep binaries on the developer's machine out of the suite.
+
+    Tests that exercise the scanner integration opt in with ``@pytest.mark.external_tools``.
+    """
+    if "external_tools" in request.keywords:
+        return
+    monkeypatch.setattr("ai_security_review.pipeline.DEFAULT_TOOLS", ())
+
+
 @pytest.fixture
 def sample_diff() -> str:
     return SAMPLE_DIFF
@@ -101,8 +112,8 @@ def triage_payload(data=True, exposure=True, access=False, conf=(0.9, 0.8, 0.3))
     }
 
 
-def scan_payload(findings):
-    return {"findings": findings, "reviewed_files": ["app/api/users.py"], "notes": "checked"}
+def scan_payload(findings, candidate_verdicts=None):
+    return {"findings": findings, "candidate_verdicts": candidate_verdicts or [], "reviewed_files": ["app/api/users.py"], "notes": "checked"}
 
 
 def finding(**overrides):

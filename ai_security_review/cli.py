@@ -25,10 +25,12 @@ from typing import Dict, List, Optional
 from ai_security_review import __version__
 from ai_security_review.constants import (
     ALL_SCANS,
+    ALL_TOOLS,
     DEFAULT_BACKEND,
     DEFAULT_MIN_FINDING_CONFIDENCE,
     DEFAULT_SCAN_EFFORT,
     DEFAULT_SCAN_MODEL,
+    DEFAULT_TOOLS,
     DEFAULT_TRIAGE_CONFIDENCE_THRESHOLD,
     DEFAULT_TRIAGE_EFFORT,
     DEFAULT_TRIAGE_MODEL,
@@ -36,7 +38,10 @@ from ai_security_review.constants import (
     EXIT_FINDINGS,
     EXIT_RUNTIME_ERROR,
     EXIT_SUCCESS,
+    GITLEAKS_CONFIG,
+    SEMGREP_CONFIG,
     SEVERITIES,
+    TOOL_TIMEOUT_SECONDS,
     VALID_BACKENDS,
 )
 from ai_security_review.diff import DiffBundle, ExclusionRules, build_bundle, git_diff, git_working_tree_diff
@@ -54,6 +59,19 @@ def _parse_scan_list(value: Optional[str]) -> Optional[List[str]]:
     bad = [k for k in keys if k not in ALL_SCANS]
     if bad:
         raise argparse.ArgumentTypeError(f"unknown scan(s): {', '.join(bad)}; valid: {', '.join(ALL_SCANS)}")
+    return keys
+
+
+def _parse_tool_list(value: Optional[str]) -> List[str]:
+    """Comma-separated tool names; 'none' (or empty) disables external scanners."""
+    if value is None:
+        return list(DEFAULT_TOOLS)
+    keys = [v.strip().lower() for v in value.split(",") if v.strip()]
+    if keys == ["none"]:
+        return []
+    bad = [k for k in keys if k not in ALL_TOOLS]
+    if bad:
+        raise argparse.ArgumentTypeError(f"unknown tool(s): {', '.join(bad)}; valid: {', '.join(ALL_TOOLS)} or none")
     return keys
 
 
@@ -110,6 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--scan-instructions-dir", default=os.environ.get("CUSTOM_SCAN_INSTRUCTIONS_DIR") or None, help="Directory with data.md / exposure.md / access.md extra instructions")
     run.add_argument("--no-context-files", action="store_true", help="Do not attach post-change file contents (API backend)")
     run.add_argument("--allow-findings-outside-diff", action="store_true", help="Keep findings in files not touched by the diff")
+
+    tools = p.add_argument_group("external scanners (run before triage; missing binaries are skipped)")
+    tools.add_argument("--tools", type=_parse_tool_list, default=_parse_tool_list(os.environ.get("AI_SECURITY_REVIEW_TOOLS")), help=f"Comma-separated scanners to run: {', '.join(ALL_TOOLS)}, or none (default: {','.join(DEFAULT_TOOLS) or 'none'})")
+    tools.add_argument("--tool-timeout", type=int, default=TOOL_TIMEOUT_SECONDS, help="Per-scanner timeout in seconds")
+    tools.add_argument("--semgrep-config", default=SEMGREP_CONFIG, help="Semgrep ruleset or rules path (default: %(default)s)")
+    tools.add_argument("--gitleaks-config", default=GITLEAKS_CONFIG, help="Path to a gitleaks TOML config (default: the repository's .gitleaks.toml or gitleaks' built-in rules)")
 
     out = p.add_argument_group("output")
     out.add_argument("--output", default=os.environ.get("RESULTS_FILE") or "security-review-results.json", help="Where to write the JSON results")
@@ -179,7 +203,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _write_json(args.output, {"error": f"Could not obtain diff: {e}"})
         return EXIT_CONFIGURATION_ERROR
 
-    logger.info("Reviewing %d file(s) (%d excluded)", len(bundle.files), len(bundle.excluded))
+    logger.info("Reviewing %d file(s) (%d excluded); scanners: %s", len(bundle.files), len(bundle.excluded), ",".join(args.tools) or "none")
 
     config = PipelineConfig(
         repo_dir=Path(args.repo_dir).resolve(),
@@ -197,6 +221,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         custom_scan_instructions=_load_custom_scan_instructions(args.scan_instructions_dir),
         include_context_files=not args.no_context_files,
         require_in_diff=not args.allow_findings_outside_diff,
+        tools=args.tools,
+        tool_timeout=args.tool_timeout,
+        tool_options={"semgrep_config": args.semgrep_config, "gitleaks_config": args.gitleaks_config},
     )
 
     try:
@@ -259,6 +286,7 @@ def _emit_github_outputs(results_file: str, result: Dict) -> None:
         fh.write(f"high-count={counts.get('HIGH', 0)}\n")
         fh.write(f"risk-level={triage.get('risk_level', 'unknown')}\n")
         fh.write(f"selected-scans={','.join(triage.get('selected_scans') or [])}\n")
+        fh.write(f"tools-run={','.join(t['tool'] for t in (result.get('tool_results') or []) if t.get('status') == 'completed')}\n")
         fh.write(f"results-file={results_file}\n")
 
 

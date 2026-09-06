@@ -14,7 +14,7 @@ GLOBAL_EXCLUSIONS = """Do NOT report any of the following, regardless of scan:
 - Style, naming, code quality, missing tests, or documentation gaps.
 - Theoretical issues with no realistic path from an attacker-controlled input to impact.
 - Pre-existing problems in code that this change does not touch or materially worsen. The review is of the *change*.
-- Findings in Markdown or plain documentation files.
+- Findings in Markdown or plain documentation files, except a literal secret pasted into one.
 - Memory-safety bugs in memory-safe languages.
 - Open redirects unless chained into token theft."""
 
@@ -73,17 +73,26 @@ def build_triage_system_prompt() -> str:
     )
 
 
-def build_triage_user_prompt(bundle: DiffBundle, pr_context: Optional[Dict] = None, custom_instructions: Optional[str] = None) -> str:
+def build_triage_user_prompt(
+    bundle: DiffBundle,
+    pr_context: Optional[Dict] = None,
+    custom_instructions: Optional[str] = None,
+    tool_signals: Optional[str] = None,
+) -> str:
     hints = "\n".join(
         f"- {SCAN_DEFINITIONS[k].key.upper()} is relevant when: {SCAN_DEFINITIONS[k].triage_hint}" for k in SCAN_ORDER
     )
     custom = f"\nADDITIONAL TRIAGE INSTRUCTIONS:\n{custom_instructions.strip()}\n" if custom_instructions else ""
+    signals = (
+        "\nSCANNER SIGNALS\nDeterministic scanners ran on the touched files before triage. Treat these as routing hints, "
+        "not confirmed bugs; a scan that owns a flagged line should normally run.\n" + tool_signals.strip() + "\n"
+    ) if tool_signals else ""
     return f"""CHANGE SUMMARY
 {_describe_change(pr_context, bundle)}
 
 RELEVANCE CRITERIA
 {hints}
-{custom}
+{custom}{signals}
 DIFF
 ```diff
 {bundle.text}
@@ -159,6 +168,7 @@ HOW TO WORK
 3. Report only issues that are introduced or materially worsened by this change. Set introduced_by_change=false only when you are flagging pre-existing code that the change makes reachable in a new way.
 4. Line numbers refer to the post-change file (the '+' side of the diff).
 5. Prefer fewer, well-evidenced findings over an exhaustive list. A security engineer should be able to raise each finding in review without embarrassment.
+6. If you are given SCANNER CANDIDATES, give every one a verdict in candidate_verdicts: "confirmed" when you can trace a realistic path from attacker input to impact, "dismissed" when the match is a false positive here (sanitised, constant input, test code, framework already mitigates), "unsure" otherwise. For each confirmed candidate also write a full finding for it; it will be merged with the candidate. Do not write findings for dismissed candidates.
 
 Severity: HIGH = directly exploitable with serious impact (data breach, account takeover, RCE, cross-tenant access). MEDIUM = exploitable under specific but realistic conditions. LOW = defense-in-depth with limited impact.
 """
@@ -187,6 +197,8 @@ def build_scan_user_prompt(
     pr_context: Optional[Dict] = None,
     context_files: Optional[Dict[str, str]] = None,
     repo_exploration_available: bool = False,
+    candidates: Optional[List[Dict]] = None,
+    reported_by_tools: Optional[List[Dict]] = None,
 ) -> str:
     scan_triage = (triage.get("scans") or {}).get(scan.key, {})
     focus = scan_triage.get("focus") or []
@@ -204,6 +216,13 @@ def build_scan_user_prompt(
     ]
     if triage.get("notes"):
         parts.append(f"Triage notes: {triage['notes']}")
+
+    if candidates:
+        parts += ["", "SCANNER CANDIDATES", "Static analysis flagged these lines in your area. Verify each one; see HOW TO WORK item 6."]
+        parts += [describe_candidate(c) for c in candidates]
+    if reported_by_tools:
+        parts += ["", "ALREADY REPORTED BY SCANNERS (no need to repeat; do add findings about how the value is *used* if that is a separate issue)"]
+        parts += [f"- {f.get('file')}:{f.get('line')} {f.get('category')}: {f.get('title')}" for f in reported_by_tools]
 
     parts += ["", "DIFF", "```diff", bundle.text, "```"]
 
@@ -225,6 +244,30 @@ def build_scan_user_prompt(
         "If there are no findings that meet the bar, return an empty findings list and explain briefly in notes what you checked.",
     ]
     return "\n".join(parts)
+
+
+def describe_candidate(c: Dict) -> str:
+    """One candidate as a prompt block: id, location, rule, message, and the matched source (if allowed)."""
+    lines = [
+        f"- [{c.get('id')}] {c.get('file')}:{c.get('line')} {c.get('category')} via {c.get('tool')} rule {c.get('rule_id')} (rule confidence {float(c.get('confidence', 0)):.2f})",
+        f"  {c.get('description', '')}",
+    ]
+    snippet = str(c.get("snippet") or "").strip()
+    if snippet:
+        lines += ["  matched source:", *("    " + ln for ln in snippet.splitlines()[:6])]
+    return "\n".join(lines)
+
+
+def describe_tool_signals(tool_findings: List[Dict], candidates: List[Dict], limit: int = 30) -> str:
+    """Compact list of scanner output for the triage prompt. Empty string when there is nothing."""
+    lines: List[str] = []
+    for f in tool_findings:
+        lines.append(f"- [{f.get('tool', f.get('scan'))}] {f.get('file')}:{f.get('line')} {f.get('category')} - {f.get('title')}")
+    for c in candidates:
+        lines.append(f"- [{c.get('tool')} candidate, {c.get('owner_scan')} scan] {c.get('file')}:{c.get('line')} {c.get('category')} - rule {c.get('rule_id')}")
+    if len(lines) > limit:
+        lines = lines[:limit] + [f"- ... {len(lines) - limit} more"]
+    return "\n".join(lines)
 
 
 def scan_output_instructions_for_cli(schema_json: str) -> str:

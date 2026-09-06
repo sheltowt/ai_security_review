@@ -70,6 +70,26 @@ inputs:
     description: 'Per-scan timeout in seconds for the claude-code backend.'
     required: false
     default: '1200'
+  tools:
+    description: 'Open-source scanners to run before triage (comma-separated: gitleaks,semgrep) or "none". gitleaks findings report directly; semgrep hits are verified by the owning scan.'
+    required: false
+    default: 'gitleaks'
+  install-tools:
+    description: 'Install the scanners listed in "tools" that are not already on PATH.'
+    required: false
+    default: 'true'
+  gitleaks-version:
+    description: 'gitleaks release to install (verified against the release checksums file).'
+    required: false
+    default: '8.30.1'
+  semgrep-version:
+    description: 'semgrep version to pip install; empty installs the latest.'
+    required: false
+    default: ''
+  semgrep-config:
+    description: 'Semgrep ruleset or rules path. Registry rulesets (p/...) need network access; "auto" is discouraged because it sends project metadata to semgrep.dev.'
+    required: false
+    default: 'p/default'
 
 outputs:
   findings-count:
@@ -87,6 +107,9 @@ outputs:
   results-file:
     description: 'Path to the results JSON.'
     value: ${{ steps.review.outputs.results-file }}
+  tools-run:
+    description: 'Comma-separated scanners that completed.'
+    value: ${{ steps.review.outputs.tools-run }}
 
 runs:
   using: 'composite'
@@ -109,6 +132,50 @@ runs:
         curl -fsSL https://claude.ai/install.sh | bash
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+    - name: Install scanners
+      if: inputs.install-tools == 'true' && inputs.tools != '' && inputs.tools != 'none'
+      shell: bash
+      env:
+        TOOLS: ${{ inputs.tools }}
+        GITLEAKS_VERSION: ${{ inputs.gitleaks-version }}
+        SEMGREP_VERSION: ${{ inputs.semgrep-version }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.local/bin"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$PATH"
+        if [[ ",$TOOLS," == *",gitleaks,"* ]] && ! command -v gitleaks >/dev/null; then
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)  asset="linux_x64" ;;
+            Linux-aarch64) asset="linux_arm64" ;;
+            Darwin-x86_64) asset="darwin_x64" ;;
+            Darwin-arm64)  asset="darwin_arm64" ;;
+            *) echo "::warning::No gitleaks build for $(uname -s)-$(uname -m); skipping"; asset="" ;;
+          esac
+          if [ -n "$asset" ]; then
+            base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+            tmp="$(mktemp -d)"
+            curl -fsSL -o "$tmp/gitleaks.tar.gz" "$base/gitleaks_${GITLEAKS_VERSION}_${asset}.tar.gz"
+            curl -fsSL -o "$tmp/checksums.txt" "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+            expected="$(grep " gitleaks_${GITLEAKS_VERSION}_${asset}.tar.gz\$" "$tmp/checksums.txt" | awk '{print $1}')"
+            actual="$(sha256sum "$tmp/gitleaks.tar.gz" | awk '{print $1}')"
+            if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+              echo "::error::gitleaks checksum mismatch (expected '$expected', got '$actual')"; exit 1
+            fi
+            tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
+            install -m 0755 "$tmp/gitleaks" "$HOME/.local/bin/gitleaks"
+            echo "Installed gitleaks $(gitleaks version)"
+          fi
+        fi
+        if [[ ",$TOOLS," == *",semgrep,"* ]] && ! command -v semgrep >/dev/null; then
+          if [ -n "$SEMGREP_VERSION" ]; then
+            python -m pip install --quiet "semgrep==${SEMGREP_VERSION}"
+          else
+            python -m pip install --quiet semgrep
+          fi
+          echo "Installed semgrep $(semgrep --version)"
+        fi
+
     - name: Run triaged security review
       id: review
       shell: bash
@@ -127,7 +194,10 @@ runs:
         RESULTS_FILE: ${{ github.workspace }}/security-review-results.json
         SUMMARY_FILE: ${{ github.workspace }}/security-review-summary.md
         AI_SECURITY_REVIEW_CLAUDE_CODE_TIMEOUT: ${{ inputs.claude-code-timeout }}
+        AI_SECURITY_REVIEW_SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+        SEMGREP_SEND_METRICS: 'off'
         INPUT_SCANS: ${{ inputs.scans }}
+        INPUT_TOOLS: ${{ inputs.tools }}
       run: |
         set -o pipefail
         args=(
@@ -142,6 +212,7 @@ runs:
         if [ -n "$INPUT_SCANS" ]; then
           args+=(--scans "$INPUT_SCANS")
         fi
+        args+=(--tools "${INPUT_TOOLS:-none}")
         if [ -z "$PR_NUMBER" ]; then
           # Not a pull_request event: review the last commit's changes.
           args+=(--base "${{ github.event.before || 'HEAD~1' }}")

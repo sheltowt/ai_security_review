@@ -75,11 +75,12 @@ def run_triage(
     effort: str = DEFAULT_TRIAGE_EFFORT,
     threshold: float = DEFAULT_TRIAGE_CONFIDENCE_THRESHOLD,
     custom_instructions: Optional[str] = None,
+    tool_signals: Optional[str] = None,
 ) -> TriageResult:
     response = client.structured_call(
         model=model,
         system=build_triage_system_prompt(),
-        user=build_triage_user_prompt(bundle, pr_context, custom_instructions),
+        user=build_triage_user_prompt(bundle, pr_context, custom_instructions, tool_signals=tool_signals),
         schema=TRIAGE_SCHEMA,
         max_tokens=TRIAGE_MAX_TOKENS,
         effort=effort,
