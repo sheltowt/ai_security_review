@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Tool output
+security-review-results.json
+security-review-summary.md
+security-review-error.log
+.ai-security-review/
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
