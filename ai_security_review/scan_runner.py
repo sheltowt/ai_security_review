@@ -38,6 +38,7 @@ class ScanResult:
     scan: str
     status: str                           # completed | failed | skipped
     findings: List[Dict[str, Any]] = field(default_factory=list)
+    candidate_verdicts: List[Dict[str, Any]] = field(default_factory=list)
     reviewed_files: List[str] = field(default_factory=list)
     notes: str = ""
     error: Optional[str] = None
@@ -50,6 +51,7 @@ class ScanResult:
             "scan": self.scan,
             "status": self.status,
             "findings_count": len(self.findings),
+            "candidate_verdicts": self.candidate_verdicts,
             "reviewed_files": self.reviewed_files,
             "notes": self.notes,
             "error": self.error,
@@ -57,6 +59,18 @@ class ScanResult:
             "backend": self.backend,
             "duration_seconds": round(self.duration_seconds, 1),
         }
+
+
+def _clean_verdicts(verdicts: Any) -> List[Dict[str, Any]]:
+    out = []
+    for v in verdicts or []:
+        if not isinstance(v, dict) or not v.get("id"):
+            continue
+        verdict = str(v.get("verdict") or "unsure").lower()
+        if verdict not in ("confirmed", "dismissed", "unsure"):
+            verdict = "unsure"
+        out.append({"id": str(v["id"]), "verdict": verdict, "reason": str(v.get("reason") or "")})
+    return out
 
 
 def _tag_findings(findings: Any, scan_key: str) -> List[Dict[str, Any]]:
@@ -95,14 +109,23 @@ class ScanRunner:
 
     # ---- public -------------------------------------------------------------------
 
-    def run_all(self, scan_keys: List[str], bundle: DiffBundle, triage: Dict, pr_context: Optional[Dict] = None) -> List[ScanResult]:
+    def run_all(
+        self,
+        scan_keys: List[str],
+        bundle: DiffBundle,
+        triage: Dict,
+        pr_context: Optional[Dict] = None,
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        tool_findings: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[ScanResult]:
         if not scan_keys:
             return []
         context_files = collect_context_files(self.repo_dir, bundle) if (self.include_context_files and self.backend == BACKEND_API) else {}
         results: Dict[str, ScanResult] = {}
         with ThreadPoolExecutor(max_workers=min(self.max_workers, len(scan_keys))) as pool:
             futures = {
-                pool.submit(self.run_one, key, bundle, triage, pr_context, context_files): key for key in scan_keys
+                pool.submit(self.run_one, key, bundle, triage, pr_context, context_files, candidates, tool_findings): key
+                for key in scan_keys
             }
             for future in as_completed(futures):
                 key = futures[future]
@@ -120,33 +143,48 @@ class ScanRunner:
         triage: Dict,
         pr_context: Optional[Dict] = None,
         context_files: Optional[Dict[str, str]] = None,
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        tool_findings: Optional[List[Dict[str, Any]]] = None,
     ) -> ScanResult:
-        scan = get_scan(scan_key)
         started = time.time()
         try:
+            scan = get_scan(scan_key)
+            mine = [c for c in (candidates or []) if c.get("owner_scan") == scan.key]
+            reported = [f for f in (tool_findings or []) if f.get("category") in scan.categories]
             if self.backend == BACKEND_CLAUDE_CODE:
-                result = self._run_claude_code(scan, bundle, triage, pr_context)
+                result = self._run_claude_code(scan, bundle, triage, pr_context, mine, reported)
             else:
-                result = self._run_api(scan, bundle, triage, pr_context, context_files or {})
+                result = self._run_api(scan, bundle, triage, pr_context, context_files or {}, mine, reported)
         except ClaudeCallError as e:
-            result = ScanResult(scan=scan.key, status="failed", error=str(e))
+            result = ScanResult(scan=scan_key, status="failed", error=str(e))
         except Exception as e:
-            logger.exception("scan %s failed", scan.key)
-            result = ScanResult(scan=scan.key, status="failed", error=f"{type(e).__name__}: {e}")
+            logger.exception("scan %s failed", scan_key)
+            result = ScanResult(scan=scan_key, status="failed", error=f"{type(e).__name__}: {e}")
         result.backend = self.backend
         result.duration_seconds = time.time() - started
-        logger.info("scan %s: %s (%d findings, %.0fs)", scan.key, result.status, len(result.findings), result.duration_seconds)
+        logger.info("scan %s: %s (%d findings, %.0fs)", scan_key, result.status, len(result.findings), result.duration_seconds)
         return result
 
     # ---- backends -----------------------------------------------------------------
 
-    def _run_api(self, scan: ScanDefinition, bundle: DiffBundle, triage: Dict, pr_context: Optional[Dict], context_files: Dict[str, str]) -> ScanResult:
+    def _run_api(
+        self,
+        scan: ScanDefinition,
+        bundle: DiffBundle,
+        triage: Dict,
+        pr_context: Optional[Dict],
+        context_files: Dict[str, str],
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        reported: Optional[List[Dict[str, Any]]] = None,
+    ) -> ScanResult:
         if self.client is None:
             raise ClaudeCallError("API backend requires a ClaudeClient")
         response = self.client.structured_call(
             model=self.model,
             system=build_scan_system_prompt(scan, self.custom_instructions.get(scan.key)),
-            user=build_scan_user_prompt(scan, bundle, triage, pr_context, context_files=context_files),
+            user=build_scan_user_prompt(
+                scan, bundle, triage, pr_context, context_files=context_files, candidates=candidates, reported_by_tools=reported
+            ),
             schema=SCAN_RESULT_SCHEMA,
             max_tokens=SCAN_MAX_TOKENS,
             effort=self.effort,
@@ -157,16 +195,27 @@ class ScanRunner:
             scan=scan.key,
             status="completed",
             findings=_tag_findings(data.get("findings"), scan.key),
+            candidate_verdicts=_clean_verdicts(data.get("candidate_verdicts")),
             reviewed_files=[str(p) for p in (data.get("reviewed_files") or [])],
             notes=str(data.get("notes", "")),
             model=response.model,
         )
 
-    def _run_claude_code(self, scan: ScanDefinition, bundle: DiffBundle, triage: Dict, pr_context: Optional[Dict]) -> ScanResult:
+    def _run_claude_code(
+        self,
+        scan: ScanDefinition,
+        bundle: DiffBundle,
+        triage: Dict,
+        pr_context: Optional[Dict],
+        candidates: Optional[List[Dict[str, Any]]] = None,
+        reported: Optional[List[Dict[str, Any]]] = None,
+    ) -> ScanResult:
         if shutil.which("claude") is None:
             raise ClaudeCallError("Claude Code CLI ('claude') not found on PATH")
         system = build_scan_system_prompt(scan, self.custom_instructions.get(scan.key))
-        user = build_scan_user_prompt(scan, bundle, triage, pr_context, repo_exploration_available=True)
+        user = build_scan_user_prompt(
+            scan, bundle, triage, pr_context, repo_exploration_available=True, candidates=candidates, reported_by_tools=reported
+        )
         prompt = user + scan_output_instructions_for_cli(json.dumps(SCAN_RESULT_SCHEMA, indent=2))
 
         cmd = [
@@ -219,6 +268,7 @@ class ScanRunner:
                 scan=scan.key,
                 status="completed",
                 findings=_tag_findings(data.get("findings"), scan.key),
+                candidate_verdicts=_clean_verdicts(data.get("candidate_verdicts")),
                 reviewed_files=[str(p) for p in (data.get("reviewed_files") or [])],
                 notes=str(data.get("notes", "")),
                 model=self.model,

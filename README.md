@@ -5,12 +5,15 @@ An AI-powered security review for code changes, modelled on
 with one structural difference: **a model triages the diff first, and only the relevant scans run.**
 
 ```
+            gitleaks ──▶ secret findings ───────────────────────────────┐
+            semgrep  ──▶ candidates ──┐                                 │
+                                      ▼                                 ▼
                          ┌──────────────┐
    diff ──▶ triage ──▶   │ data scan    │ ──┐
             (1 call)     ├──────────────┤   │
             picks 0–3    │ exposure scan│ ──┼──▶ filter + dedupe ──▶ report / PR comments
             of:          ├──────────────┤   │
-                         │ access scan  │ ──┘
+                         │ access scan  │ ──┘  (scans confirm or dismiss the candidates)
                          └──────────────┘
 ```
 
@@ -24,6 +27,11 @@ Each scan answers exactly one question:
 
 The scans have explicit hand-off rules so the same bug is not reported three times, and findings that two
 scans both catch are merged. Full definitions are in [docs/scans.md](docs/scans.md).
+
+Two open-source scanners run alongside the model, when installed: **gitleaks** reports hardcoded secrets
+directly (and flags secrets this change *removes*, which are still in git history), and **Semgrep** hits
+become candidates that the owning scan confirms or dismisses, so static-analysis noise never reaches the PR
+without a model tracing the flow first. See [docs/tools.md](docs/tools.md).
 
 ## Why triage first
 
@@ -60,6 +68,7 @@ jobs:
           # fail-on-severity: HIGH        # gate merges on HIGH findings
           # backend: claude-code          # let scans explore the repo
           # scan-instructions-dir: .security-review
+          # tools: gitleaks,semgrep       # gitleaks is on by default; semgrep adds ~1 min of install
 ```
 
 The action posts one summary comment (triage table plus findings, updated in place on re-runs) and inline
@@ -84,8 +93,12 @@ job summary.
 | `comment-pr` | `true` | Post summary and inline comments |
 | `fail-on-severity` | `NONE` | Fail the step at or above this severity |
 | `upload-results` | `true` | Upload results as an artifact |
+| `tools` | `gitleaks` | Open-source scanners to run (`gitleaks,semgrep`) or `none` |
+| `install-tools` | `true` | Install listed scanners that are missing (gitleaks from a pinned, checksum-verified release; semgrep via pip) |
+| `gitleaks-version` / `semgrep-version` | `8.30.1` / latest | Versions to install |
+| `semgrep-config` | `p/default` | Semgrep ruleset or rules path |
 
-Outputs: `findings-count`, `high-count`, `risk-level`, `selected-scans`, `results-file`.
+Outputs: `findings-count`, `high-count`, `risk-level`, `selected-scans`, `tools-run`, `results-file`.
 
 ## Quick start: command line
 
@@ -104,6 +117,10 @@ GITHUB_TOKEN=... ai-security-review --repo owner/name --pr 42 --comment-pr
 
 # Skip triage, force all three scans, let them explore the repo through Claude Code
 ai-security-review --base main --scans data,exposure,access --backend claude-code
+
+# Run without external scanners, or with a custom Semgrep ruleset
+ai-security-review --base main --tools none
+ai-security-review --base main --tools gitleaks,semgrep --semgrep-config p/owasp-top-ten
 ```
 
 The CLI prints a Markdown summary and writes `security-review-results.json`. Run `ai-security-review --help`
@@ -131,14 +148,15 @@ scans. Copy it into your project's `.claude/commands/` to use it there.
     },
     "selected_scans": ["data", "exposure"]
   },
-  "scan_results": [{"scan": "data", "status": "completed", "findings_count": 1, "duration_seconds": 41.2, ...}],
+  "tool_results": [{"tool": "gitleaks", "status": "completed", "version": "8.30.1", "findings_count": 0, "candidates_count": 0, ...}],
+  "scan_results": [{"scan": "data", "status": "completed", "findings_count": 1, "candidate_verdicts": [], "duration_seconds": 41.2, ...}],
   "findings": [{
     "file": "app/api/users.py", "line": 15, "severity": "HIGH", "category": "sql_injection",
     "title": "SQL injection in export_user", "description": "...", "exploit_scenario": "...",
     "recommendation": "...", "confidence": 0.95, "introduced_by_change": true, "scans": ["data"]
   }],
   "severity_counts": {"HIGH": 1, "MEDIUM": 1, "LOW": 0},
-  "filter_summary": {"total": 3, "kept": 2, "excluded_low_confidence": 1, "merged_duplicates": 0, "excluded_details": [...]},
+  "filter_summary": {"total": 3, "kept": 2, "excluded_low_confidence": 1, "merged_duplicates": 0, "candidates_total": 0, "candidates_confirmed": 0, "candidates_dismissed": 0, "candidates_unverified": 0, "excluded_details": [...]},
   "usage": {"input_tokens": 48210, "output_tokens": 3120}
 }
 ```
@@ -158,19 +176,26 @@ ai_security_review/
 ├── findings.py       # normalisation, hard exclusions, confidence filter, cross-scan dedupe
 ├── github_client.py  # PR data, diff, summary + inline review comments
 ├── report.py         # Markdown rendering
+├── tools/            # open-source scanners: gitleaks (secrets), semgrep (SAST candidates), CWE -> category map
 └── tests/
 ```
 
 1. **Diff acquisition.** From a file, a git range, the working tree, or the GitHub API. Generated files,
    lockfiles, and excluded directories are dropped before any model sees the diff.
-2. **Triage.** One structured-output call returns a summary, risk level, and per-scan relevance with confidence
-   and a focus list. Scans at or above the threshold are selected; `--always-scans` can add more.
-3. **Scans.** Each selected scan gets its own system prompt (scope, hand-offs, signals, exclusions, rubric) and
-   the triage focus. With the `api` backend the scan also receives the post-change contents of touched files;
-   with `claude-code` it can explore the repository with read-only tools. Scans run concurrently.
-4. **Filtering.** Findings are normalised, hard-excluded classes removed, low-confidence and out-of-diff
-   findings dropped, and near-duplicates across scans merged (keeping the stronger write-up and tagging both scans).
-5. **Reporting.** JSON results, a Markdown summary, GitHub job summary, and optional PR comments.
+2. **Scanners.** gitleaks and Semgrep run in parallel on the touched files, restricted to added lines. Secret
+   hits are findings; Semgrep hits are candidates mapped by CWE to the scan that owns them. Missing binaries
+   are skipped.
+3. **Triage.** One structured-output call returns a summary, risk level, and per-scan relevance with confidence
+   and a focus list. Scanner output is included as routing hints. Scans at or above the threshold are selected;
+   `--always-scans` can add more, and any scan that owns a candidate is added so it can give a verdict.
+4. **Scans.** Each selected scan gets its own system prompt (scope, hand-offs, signals, exclusions, rubric),
+   the triage focus, and its candidates to confirm or dismiss. With the `api` backend the scan also receives the
+   post-change contents of touched files; with `claude-code` it can explore the repository with read-only tools.
+   Scans run concurrently.
+5. **Filtering.** Candidates are resolved against the verdicts. Findings are normalised, hard-excluded classes
+   removed, low-confidence and out-of-diff findings dropped, and near-duplicates across scans and scanners
+   merged (keeping the stronger write-up and tagging every source).
+6. **Reporting.** JSON results, a Markdown summary, GitHub job summary, and optional PR comments.
 
 Model calls use structured outputs so the JSON always matches the schema, and opt into Anthropic's
 server-side refusal fallback so a safety-classifier decline on a security-flavoured prompt is retried on a

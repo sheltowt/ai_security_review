@@ -86,7 +86,7 @@ EXPOSURE_SCAN = ScanDefinition(
         "new_unauthenticated_surface", "xss_reflected", "xss_stored", "xss_dom", "html_or_header_injection",
         "permissive_cors", "missing_security_header_with_impact", "insecure_transport",
         "public_cloud_resource_or_bucket", "secret_in_url_or_query", "metadata_or_internal_service_exposure",
-        "dependency_or_supply_chain_exposure", "token_or_session_leak_to_third_party",
+        "dependency_or_supply_chain_exposure", "token_or_session_leak_to_third_party", "secret_in_history",
     ],
     in_scope=[
         "Literal secrets: API keys, passwords, private keys, tokens, connection strings, webhook secrets - in code, config, tests, fixtures, CI files, Dockerfiles, or comments.",
@@ -192,13 +192,29 @@ FINDING_SCHEMA: Dict = {
     "additionalProperties": False,
 }
 
+CANDIDATE_VERDICT_SCHEMA: Dict = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string", "description": "The candidate id exactly as given (e.g. semgrep-2)."},
+        "verdict": {"type": "string", "enum": ["confirmed", "dismissed", "unsure"]},
+        "reason": {"type": "string", "description": "One sentence: why it is (or is not) exploitable here."},
+    },
+    "required": ["id", "verdict", "reason"],
+    "additionalProperties": False,
+}
+
 SCAN_RESULT_SCHEMA: Dict = {
     "type": "object",
     "properties": {
         "findings": {"type": "array", "items": FINDING_SCHEMA},
+        "candidate_verdicts": {
+            "type": "array",
+            "items": CANDIDATE_VERDICT_SCHEMA,
+            "description": "One verdict per scanner candidate you were given. Empty when there were none.",
+        },
         "reviewed_files": {"type": "array", "items": {"type": "string"}},
         "notes": {"type": "string", "description": "Brief notes on what was checked and any areas that could not be fully assessed."},
     },
-    "required": ["findings", "reviewed_files", "notes"],
+    "required": ["findings", "candidate_verdicts", "reviewed_files", "notes"],
     "additionalProperties": False,
 }
