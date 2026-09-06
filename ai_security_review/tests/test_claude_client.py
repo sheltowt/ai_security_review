@@ -111,3 +111,40 @@ def test_unparseable_output_retried_once(monkeypatch):
     with pytest.raises(ClaudeCallError, match="could not parse"):
         client.structured_call(model="m", system="s", user="u", schema={}, max_tokens=10)
     assert len(messages.calls) == 2
+
+
+def test_connection_error_retried(monkeypatch):
+    monkeypatch.setattr("ai_security_review.claude_client.time.sleep", lambda _: None)
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    client, messages = _client([anthropic.APIConnectionError(request=req), _Message("{}")])
+    client.structured_call(model="m", system="s", user="u", schema={}, max_tokens=10)
+    assert len(messages.calls) == 2
+
+
+def test_max_tokens_truncation_retried_then_fails(monkeypatch):
+    client, messages = _client([_Message("{", stop_reason="max_tokens"), _Message("{", stop_reason="max_tokens")])
+    with pytest.raises(ClaudeCallError, match="max_tokens"):
+        client.structured_call(model="m", system="s", user="u", schema={}, max_tokens=10)
+    assert len(messages.calls) == 2
+
+
+def test_exhausted_retries_raise(monkeypatch):
+    monkeypatch.setattr("ai_security_review.claude_client.time.sleep", lambda _: None)
+    errors = [_status_error(anthropic.InternalServerError, 503) for _ in range(3)]
+    client, _ = _client(errors, max_retries=3)
+    with pytest.raises(ClaudeCallError, match="failed after 3 attempts"):
+        client.structured_call(model="m", system="s", user="u", schema={}, max_tokens=10)
+
+
+def test_retry_after_header_parsing():
+    from ai_security_review.claude_client import _retry_after_seconds
+
+    def err(headers):
+        req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        return anthropic.RateLimitError("x", response=httpx.Response(429, request=req, headers=headers), body=None)
+
+    assert _retry_after_seconds(err({"retry-after": "7"}), default=30) == 7
+    assert _retry_after_seconds(err({"retry-after": "9999"}), default=30) == 120   # capped
+    assert _retry_after_seconds(err({"retry-after": "soon"}), default=30) == 30    # unparseable
+    assert _retry_after_seconds(err({}), default=30) == 30                         # absent
+    assert _retry_after_seconds(RuntimeError("no response attr"), default=4) == 4
