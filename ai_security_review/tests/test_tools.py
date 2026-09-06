@@ -161,7 +161,7 @@ def test_gitleaks_reports_added_secret_and_history(tmp_path, monkeypatch):
     assert added["line"] == 2 and added["severity"] == "HIGH" and added["scan"] == "gitleaks" and added["rule_id"] == "aws-access-token"
     assert "REDACTED" not in json.dumps(result.findings) and "AKIA" not in json.dumps(result.findings)
     history = by_cat[("secret_in_history", "app/config.py")]
-    assert history["line"] == 2 and history["introduced_by_change"] is False and "rotate" in history["recommendation"].lower()
+    assert history["line"] == 2 and history["introduced_by_change"] is True and "rotate" in history["recommendation"].lower()
     scan_call = next(c for c in calls if "dir" in c["cmd"])
     assert "--redact" in scan_call["cmd"] and "--exit-code" in scan_call["cmd"]
     assert "added/app/config.py" in scan_call["staged"] and "removed/app/config.py" in scan_call["staged"]

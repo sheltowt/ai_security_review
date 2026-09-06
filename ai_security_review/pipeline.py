@@ -3,7 +3,7 @@
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ai_security_review import __version__
 from ai_security_review.claude_client import ClaudeCallError, ClaudeClient
@@ -12,14 +12,13 @@ from ai_security_review.constants import (
     DEFAULT_MIN_FINDING_CONFIDENCE,
     DEFAULT_SCAN_EFFORT,
     DEFAULT_SCAN_MODEL,
-    DEFAULT_TOOLS,
     DEFAULT_TRIAGE_CONFIDENCE_THRESHOLD,
     DEFAULT_TRIAGE_EFFORT,
     DEFAULT_TRIAGE_MODEL,
     TOOL_TIMEOUT_SECONDS,
 )
 from ai_security_review.diff import DiffBundle, ExclusionRules
-from ai_security_review.findings import normalize_finding, process_findings, resolve_candidates, severity_counts, similar_findings
+from ai_security_review.findings import collapse_candidates, normalize_finding, process_findings, resolve_candidates, severity_counts
 from ai_security_review.logger import get_logger
 from ai_security_review.prompts import describe_tool_signals
 from ai_security_review.scan_runner import ScanResult, ScanRunner
@@ -46,7 +45,7 @@ class PipelineConfig:
     custom_scan_instructions: Dict[str, str] = field(default_factory=dict)
     include_context_files: bool = True
     require_in_diff: bool = True
-    tools: List[str] = field(default_factory=lambda: list(DEFAULT_TOOLS))  # external scanners to run before triage
+    tools: List[str] = field(default_factory=list)  # external scanners to run before triage; the CLI passes DEFAULT_TOOLS
     tool_timeout: int = TOOL_TIMEOUT_SECONDS
     tool_options: Dict[str, str] = field(default_factory=dict)  # e.g. semgrep_config, gitleaks_config
 
@@ -84,6 +83,7 @@ def run_pipeline(config: PipelineConfig, bundle: DiffBundle, pr_context: Optiona
     result["tool_results"] = [t.to_dict() for t in tool_results]
     tool_findings = [f for t in tool_results for f in t.findings]
     candidates, redundant = collapse_candidates([c for t in tool_results for c in t.candidates], tool_findings)
+    unowned: List[Dict[str, Any]] = []
 
     # 1. Triage
     try:
@@ -103,27 +103,24 @@ def run_pipeline(config: PipelineConfig, bundle: DiffBundle, pr_context: Optiona
     except ClaudeCallError as e:
         logger.error("Triage failed: %s", e)
         result["error"] = f"Triage failed: {e}"
-        # Scanner findings are still worth reporting even when the model could not be reached.
-        kept, filter_summary = process_findings(tool_findings, bundle, rules, config.min_confidence, config.require_in_diff)
-        result["findings"] = kept
-        result["severity_counts"] = severity_counts(kept)
-        result["filter_summary"] = filter_summary.to_dict()
+        # Scanner output is still worth reporting even when the model could not be reached.
+        _finalise_findings(result, config, bundle, rules, [], tool_findings, candidates, {}, redundant)
         result["duration_seconds"] = round(time.time() - started, 1)
         _record_usage(result, client)
         return result
 
-    selected = list(triage.selected_scans)
     for key in config.always_scans:
-        if key not in selected:
-            selected.append(key)
-            triage.scans[key]["reason"] = (triage.scans[key].get("reason") or "") + " (always-run)"
+        triage.ensure_selected(key, "always-run")
     if config.forced_scans is None:
         # A scanner candidate deserves a verdict from the scan that owns it, whatever triage thought.
         for key in sorted({c["owner_scan"] for c in candidates}):
-            if key not in selected:
-                selected.append(key)
-                triage.scans[key]["reason"] = (triage.scans[key].get("reason") or "") + " (added to verify scanner candidates)"
-    triage.selected_scans = selected
+            triage.ensure_selected(key, "added to verify scanner candidates")
+    else:
+        # Forced means forced: candidates whose owner scan was not requested get no verdict and are
+        # not reported on a pattern match alone.
+        unowned = [c for c in candidates if c["owner_scan"] not in triage.selected_scans]
+        candidates = [c for c in candidates if c["owner_scan"] in triage.selected_scans]
+    selected = list(triage.selected_scans)
     result["triage"] = triage.to_dict()
 
     # 2. Scans
@@ -141,18 +138,8 @@ def run_pipeline(config: PipelineConfig, bundle: DiffBundle, pr_context: Optiona
 
     # 3. Resolve scanner candidates against the scans' verdicts, then filter + dedupe everything together
     verdicts = {v["id"]: {**v, "scan": s.scan} for s in scan_results for v in s.candidate_verdicts}
-    promoted, dismissed_details, counts = resolve_candidates(candidates, verdicts, config.min_confidence)
-    raw = [f for s in scan_results for f in s.findings] + tool_findings + promoted
-    kept, filter_summary = process_findings(raw, bundle, rules, config.min_confidence, config.require_in_diff)
-    filter_summary.candidates_total = counts["total"] + redundant
-    filter_summary.candidates_confirmed = counts["confirmed"]
-    filter_summary.candidates_dismissed = counts["dismissed"]
-    filter_summary.candidates_unverified = counts["unverified"]
-    filter_summary.merged_duplicates += redundant
-    filter_summary.excluded_details.extend(dismissed_details)
-    result["findings"] = kept
-    result["severity_counts"] = severity_counts(kept)
-    result["filter_summary"] = filter_summary.to_dict()
+    model_findings = [f for s in scan_results for f in s.findings]
+    _finalise_findings(result, config, bundle, rules, model_findings, tool_findings, candidates, verdicts, redundant, unowned)
 
     failed = [s for s in scan_results if s.status == "failed"]
     if failed and len(failed) == len(scan_results):
@@ -163,31 +150,36 @@ def run_pipeline(config: PipelineConfig, bundle: DiffBundle, pr_context: Optiona
     return result
 
 
-def collapse_candidates(candidates: List[Dict[str, Any]], tool_findings: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
-    """Drop candidates a scanner already reports outright, and fold several rules on one line into one candidate.
-
-    Returns ``(candidates, dropped_count)``. Ids are reassigned so they stay dense and stable.
-    """
-    reported = [normalize_finding(f) for f in tool_findings]
-    kept: List[Dict[str, Any]] = []
-    dropped = 0
-    for c in candidates:
-        probe = normalize_finding(c)
-        if any(similar_findings(probe, r) for r in reported):
-            dropped += 1
-            continue
-        twin = next((k for k in kept if k["file"] == c["file"] and k["category"] == c["category"] and abs(k["line"] - c["line"]) <= 3), None)
-        if twin is None:
-            kept.append(dict(c))
-            continue
-        dropped += 1
-        twin["rule_id"] = f"{twin['rule_id']}, {c['rule_id']}"
-        twin["confidence"] = max(twin["confidence"], c["confidence"])
-        if c.get("description") and c["description"] not in twin.get("description", ""):
-            twin["description"] = f"{twin.get('description', '')} Also matched by '{c['rule_id']}'."
-    for i, c in enumerate(kept, 1):
-        c["id"] = f"{c.get('tool', 'tool')}-{i}"
-    return kept, dropped
+def _finalise_findings(
+    result: Dict[str, Any],
+    config: PipelineConfig,
+    bundle: DiffBundle,
+    rules: ExclusionRules,
+    model_findings: List[Dict[str, Any]],
+    tool_findings: List[Dict[str, Any]],
+    candidates: List[Dict[str, Any]],
+    verdicts: Dict[str, Dict[str, Any]],
+    redundant: int,
+    unowned: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Resolve candidates, then run every finding through the single filter + dedupe pass."""
+    promoted, dismissed_details, counts = resolve_candidates(candidates, verdicts)
+    kept, summary = process_findings(
+        model_findings + tool_findings + promoted, bundle, rules, config.min_confidence, config.require_in_diff
+    )
+    summary.candidates_total = counts["total"] + redundant + len(unowned or [])
+    summary.candidates_confirmed = counts["confirmed"]
+    summary.candidates_dismissed = counts["dismissed"]
+    summary.candidates_unverified = counts["unverified"] + len(unowned or [])
+    summary.merged_duplicates += redundant
+    summary.excluded_details.extend(dismissed_details)
+    for c in unowned or []:
+        summary.excluded_details.append(
+            {**normalize_finding(c), "excluded_reason": f"Scanner candidate for the {c['owner_scan']} scan, which was not among the forced scans"}
+        )
+    result["findings"] = kept
+    result["severity_counts"] = severity_counts(kept)
+    result["filter_summary"] = summary.to_dict()
 
 
 def _record_usage(result: Dict[str, Any], client: Optional[ClaudeClient]) -> None:

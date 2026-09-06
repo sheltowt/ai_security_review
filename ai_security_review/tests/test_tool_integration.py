@@ -5,10 +5,10 @@ import json
 import pytest
 
 from ai_security_review.cli import build_parser
-from ai_security_review.constants import BACKEND_API
+from ai_security_review.constants import BACKEND_API, UNVERIFIED_CANDIDATE_MAX_CONFIDENCE
 from ai_security_review.diff import build_bundle
-from ai_security_review.findings import HardExclusionRules, merge_duplicates, normalize_finding, process_findings, resolve_candidates
-from ai_security_review.pipeline import PipelineConfig, collapse_candidates, run_pipeline
+from ai_security_review.findings import HardExclusionRules, collapse_candidates, merge_duplicates, normalize_finding, process_findings, resolve_candidates
+from ai_security_review.pipeline import PipelineConfig, run_pipeline
 from ai_security_review.prompts import build_scan_user_prompt, build_triage_user_prompt, describe_tool_signals
 from ai_security_review.report import finding_comment_body, render_markdown_summary
 from ai_security_review.scan_runner import ScanRunner
@@ -125,24 +125,32 @@ def test_resolve_candidates_verdicts():
     cands = [
         _candidate(id="semgrep-1"),                                   # confirmed
         _candidate(id="semgrep-2", line=16),                          # dismissed
-        _candidate(id="semgrep-3", line=17),                          # unsure, low confidence -> dropped
-        _candidate(id="semgrep-4", line=18, confidence=0.8),          # no verdict, high confidence -> kept
-        _candidate(id="semgrep-5", line=19),                          # no verdict, low confidence -> dropped
+        _candidate(id="semgrep-3", line=17),                          # unsure -> capped
+        _candidate(id="semgrep-4", line=18, confidence=0.8),          # no verdict, high rule confidence -> still capped
+        _candidate(id="semgrep-5", line=19),                          # no verdict, low confidence -> capped
     ]
     verdicts = {
         "semgrep-1": {"id": "semgrep-1", "verdict": "confirmed", "reason": "q reaches the query", "scan": "data"},
         "semgrep-2": {"id": "semgrep-2", "verdict": "dismissed", "reason": "constant input", "scan": "data"},
         "semgrep-3": {"id": "semgrep-3", "verdict": "unsure", "reason": "could not trace", "scan": "data"},
     }
-    promoted, excluded, counts = resolve_candidates(cands, verdicts, 0.7)
+    findings, excluded, counts = resolve_candidates(cands, verdicts)
     assert counts == {"total": 5, "confirmed": 1, "dismissed": 1, "unverified": 3}
-    assert [p["line"] for p in promoted] == [15, 18]
-    assert promoted[0]["confidence"] == 0.85 and sorted(promoted[0]["scans"]) == ["data", "semgrep"] and "Confirmed by the data scan: q reaches the query" in promoted[0]["description"]
-    assert promoted[1]["scans"] == ["semgrep"] and promoted[1]["confidence"] == 0.8
-    assert "owner_scan" not in promoted[0] and "snippet" not in promoted[0] and "id" not in promoted[0]
-    reasons = [e["excluded_reason"] for e in excluded]
-    assert reasons[0].startswith("Dismissed by the data scan: constant input")
-    assert "was unsure" in reasons[1] and "no scan verified it" in reasons[2]
+    assert [f["line"] for f in findings] == [15, 17, 18, 19]
+    confirmed = findings[0]
+    assert confirmed["confidence"] == 0.85 and sorted(confirmed["scans"]) == ["data", "semgrep"]
+    assert "Confirmed by the data scan: q reaches the query" in confirmed["description"]
+    assert "owner_scan" not in confirmed and "snippet" not in confirmed and "id" not in confirmed
+    # Unverified candidates never exceed the cap, whatever the rule claimed, and say why
+    for f in findings[1:]:
+        assert f["confidence"] <= UNVERIFIED_CANDIDATE_MAX_CONFIDENCE and f["scans"] == ["semgrep"]
+    assert "could not confirm or rule this out: could not trace" in findings[1]["description"]
+    assert "No scan verified this scanner candidate" in findings[2]["description"]
+    assert [e["excluded_reason"] for e in excluded] == ["Dismissed by the data scan: constant input"]
+    # The single threshold pass in process_findings is what keeps unverified candidates out
+    kept, summary = process_findings(findings, None, None, 0.7)
+    assert [k["line"] for k in kept] == [15]
+    assert summary.excluded_low_confidence == 3
 
 
 def test_collapse_candidates():
@@ -196,7 +204,8 @@ def test_pipeline_reports_tool_findings_and_verifies_candidates(tmp_path, bundle
     assert (filt["candidates_total"], filt["candidates_confirmed"], filt["candidates_dismissed"], filt["candidates_unverified"]) == (3, 1, 1, 1)
     reasons = [e["excluded_reason"] for e in filt["excluded_details"]]
     assert any(r.startswith("Dismissed by the data scan: argument is constant") for r in reasons)
-    assert any("the access scan was unsure" in r for r in reasons)
+    unsure = next(e for e in filt["excluded_details"] if e["category"] == "csrf")
+    assert unsure["excluded_reason"].startswith("Confidence") and "could not confirm or rule this out: framework unclear" in unsure["description"]
     json.dumps(result)
 
     md = render_markdown_summary(result)
@@ -214,15 +223,42 @@ def test_pipeline_tool_findings_survive_triage_failure(tmp_path, bundle, fake_cl
     assert [f["category"] for f in result["findings"]] == ["hardcoded_secret"]
 
 
-def test_pipeline_forced_scans_do_not_auto_select_owner(tmp_path, bundle, fake_client_factory, helpers, monkeypatch):
+def test_pipeline_forced_scans_drop_unowned_candidates(tmp_path, bundle, fake_client_factory, helpers, monkeypatch):
     monkeypatch.setattr("ai_security_review.pipeline.run_tools", lambda *a, **kw: _tool_results(candidates=[_candidate(confidence=0.8)]))
     client = fake_client_factory({"scan": helpers["scan_payload"]([])})
     result = run_pipeline(_config(tmp_path, forced_scans=["exposure"]), bundle, client=client)
     assert [c["label"] for c in client.calls] == ["scan:exposure"]
-    # nobody verified it, but the rule confidence clears the bar so it is reported on its own
+    # The data scan was not forced, so its candidate gets no verdict and is not reported on the rule alone
+    assert result["findings"] == []
+    assert "SCANNER CANDIDATES" not in client.calls[0]["user"]
+    fs = result["filter_summary"]
+    assert fs["candidates_total"] == 1 and fs["candidates_unverified"] == 1
+    assert "not among the forced scans" in fs["excluded_details"][0]["excluded_reason"]
+
+
+def test_pipeline_unverified_candidate_needs_lower_threshold(tmp_path, bundle, fake_client_factory, helpers, monkeypatch):
+    """A scan that ran but gave no verdict leaves the candidate capped; only a lower --min-confidence shows it."""
+    monkeypatch.setattr("ai_security_review.pipeline.run_tools", lambda *a, **kw: _tool_results(candidates=[_candidate(confidence=0.8)]))
+    triage = helpers["triage_payload"](data=True, exposure=False, access=False)
+    client = fake_client_factory({"triage": triage, "scan": helpers["scan_payload"]([])})
+    result = run_pipeline(_config(tmp_path), bundle, client=client)
+    assert result["findings"] == [] and result["filter_summary"]["candidates_unverified"] == 1
+    client = fake_client_factory({"triage": triage, "scan": helpers["scan_payload"]([])})
+    result = run_pipeline(_config(tmp_path, min_confidence=0.5), bundle, client=client)
     assert [f["category"] for f in result["findings"]] == ["sql_injection"]
-    assert result["findings"][0]["scans"] == ["semgrep"]
-    assert result["filter_summary"]["candidates_unverified"] == 1
+    assert result["findings"][0]["confidence"] == UNVERIFIED_CANDIDATE_MAX_CONFIDENCE
+
+
+def test_pipeline_triage_failure_still_reports_tool_output(tmp_path, bundle, fake_client_factory, helpers, monkeypatch):
+    secret = _secret()
+    monkeypatch.setattr("ai_security_review.pipeline.run_tools", lambda *a, **kw: _tool_results(findings=[secret], candidates=[_candidate(confidence=0.9)]))
+    client = fake_client_factory({}, fail_labels=["triage"])
+    result = run_pipeline(_config(tmp_path), bundle, client=client)
+    assert result["error"].startswith("Triage failed")
+    assert [f["category"] for f in result["findings"]] == ["hardcoded_secret"]
+    fs = result["filter_summary"]
+    assert fs["candidates_total"] == 1 and fs["candidates_unverified"] == 1
+    assert any("No scan verified" in e.get("description", "") for e in fs["excluded_details"])
 
 
 def test_pipeline_skipped_tools_render(tmp_path, bundle, fake_client_factory, helpers, monkeypatch):
@@ -256,7 +292,8 @@ def test_pipeline_runs_real_tools_when_installed(tmp_path, bundle, fake_client_f
 # ---- CLI ---------------------------------------------------------------------------
 
 
-def test_cli_tool_flags():
+def test_cli_tool_flags(monkeypatch):
+    monkeypatch.setattr("ai_security_review.cli.DEFAULT_TOOLS", ("gitleaks", "semgrep"))
     parser = build_parser()
     assert parser.parse_args(["--tools", "gitleaks"]).tools == ["gitleaks"]
     assert parser.parse_args(["--tools", "none"]).tools == []
@@ -264,3 +301,68 @@ def test_cli_tool_flags():
     assert parser.parse_args([]).tools == ["gitleaks", "semgrep"]
     with pytest.raises(SystemExit):
         parser.parse_args(["--tools", "snyk"])
+
+
+def test_cli_tools_env_var_none(monkeypatch):
+    monkeypatch.setenv("AI_SECURITY_REVIEW_TOOLS", "none")
+    assert build_parser().parse_args([]).tools == []
+
+
+def test_pipeline_config_runs_no_tools_by_default(tmp_path):
+    assert PipelineConfig(repo_dir=tmp_path).tools == []
+
+
+# ---- follow-ups from the post-merge review -------------------------------------------------
+
+
+def test_open_redirect_suppressed_at_intake():
+    from ai_security_review.tools.categories import CWE_TO_CATEGORY, _EXTRA_OWNERS, is_suppressed, owner_scan
+
+    assert is_suppressed(["CWE-601: URL Redirection to Untrusted Site"])
+    assert 601 not in CWE_TO_CATEGORY
+    # ownership has a single source: nothing in the extra map duplicates a ScanDefinition category
+    assert not any(owner_scan(cat) != owner for cat, owner in _EXTRA_OWNERS.items())
+    assert "secret_in_history" not in _EXTRA_OWNERS and owner_scan("secret_in_history") == "exposure"
+
+
+def test_secret_categories_single_source():
+    from ai_security_review.constants import SECRET_CATEGORIES
+    from ai_security_review.findings import HardExclusionRules
+
+    for cat in SECRET_CATEGORIES:
+        assert HardExclusionRules.exclusion_reason({"file": "docs/setup.md", "category": cat, "description": "x"}) is None
+    assert HardExclusionRules.exclusion_reason({"file": "docs/setup.md", "category": "xss_dom", "description": "x"})
+
+
+def test_ensure_selected_is_idempotent():
+    from ai_security_review.triage import forced_triage
+
+    t = forced_triage(["data"])
+    assert t.ensure_selected("access", "always-run") is True
+    assert t.ensure_selected("access", "again") is False
+    assert t.selected_scans == ["data", "access"]
+    assert t.scans["access"]["reason"].endswith("(always-run)")
+
+
+def test_history_finding_renders_without_preexisting_footnote():
+    from ai_security_review.tools.gitleaks import GitleaksTool
+
+    f = normalize_finding(GitleaksTool()._history_finding({"Description": "AWS key"}, "cfg.py", "aws-access-token", 2))
+    assert f["introduced_by_change"] is True
+    assert "Pre-existing code" not in finding_comment_body(f)
+
+
+def test_gitleaksignore_prefixed_for_both_trees(tmp_path):
+    from ai_security_review.tools.gitleaks import GitleaksTool
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "cfg.py").write_text("x = 1\n")
+    (repo / ".gitleaksignore").write_text("# comment\ncfg.py:aws-access-token:2\n")
+    diff = "diff --git a/cfg.py b/cfg.py\n--- a/cfg.py\n+++ b/cfg.py\n@@ -1 +1 @@\n-old\n+x = 1\n"
+    bundle = build_bundle(diff)
+    root = tmp_path / "stage"
+    root.mkdir()
+    GitleaksTool()._stage_files(root, repo, GitleaksTool.present_files(repo, bundle), bundle)
+    lines = (root / ".gitleaksignore").read_text().splitlines()
+    assert lines == ["# comment", "cfg.py:aws-access-token:2", "added/cfg.py:aws-access-token:2", "removed/cfg.py:aws-access-token:2"]

@@ -8,7 +8,7 @@ and tells the pipeline which scan should verify a candidate.
 import re
 from typing import Dict, Optional
 
-from ai_security_review.constants import SCAN_DATA, SCAN_EXPOSURE
+from ai_security_review.constants import SCAN_DATA
 from ai_security_review.scans import SCAN_DEFINITIONS
 
 # CWE number -> review category. Kept to CWEs that map cleanly; anything else falls back to a generic
@@ -48,7 +48,6 @@ CWE_TO_CATEGORY: Dict[int, str] = {
     614: "missing_security_header_with_impact", 1004: "missing_security_header_with_impact", 1021: "missing_security_header_with_impact",
     295: "insecure_transport", 297: "insecure_transport",
     494: "dependency_or_supply_chain_exposure", 829: "dependency_or_supply_chain_exposure", 1104: "dependency_or_supply_chain_exposure",
-    601: "open_redirect",
     # access
     287: "authentication_bypass", 288: "authentication_bypass", 306: "authentication_bypass",
     284: "broken_authorization", 285: "broken_authorization", 863: "broken_authorization",
@@ -61,15 +60,17 @@ CWE_TO_CATEGORY: Dict[int, str] = {
     1392: "insecure_default_credentials",
 }
 
-# CWEs whose findings the review never reports (see HardExclusionRules and GLOBAL_EXCLUSIONS).
-SUPPRESSED_CWES = {400, 770, 1333, 835, 401, 772}
+# CWEs whose findings the review never reports (see HardExclusionRules and GLOBAL_EXCLUSIONS):
+# DoS / resource exhaustion (400, 770), ReDoS (1333), infinite loops (835), resource leaks (401, 772),
+# and open redirects (601), which the hard-exclusion rule would drop after a scan had already spent
+# effort verifying them.
+SUPPRESSED_CWES = {400, 770, 1333, 835, 401, 772, 601}
 
-# Categories that are not in any ScanDefinition but still have an obvious owner.
+# Categories that are not in any ScanDefinition but still have an obvious owner. Anything listed in a
+# ScanDefinition's categories is owned there; this map must not duplicate those.
 _EXTRA_OWNERS: Dict[str, str] = {
     "server_side_request_forgery": SCAN_DATA,
     "prototype_pollution": SCAN_DATA,
-    "open_redirect": SCAN_EXPOSURE,
-    "secret_in_history": SCAN_EXPOSURE,
     "security_issue": SCAN_DATA,
 }
 

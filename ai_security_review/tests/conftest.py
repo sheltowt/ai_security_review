@@ -51,13 +51,14 @@ index 7777777..8888888 100644
 
 @pytest.fixture(autouse=True)
 def no_external_tools(request, monkeypatch):
-    """Keep gitleaks/semgrep binaries on the developer's machine out of the suite.
+    """Keep gitleaks/semgrep binaries on the developer's machine out of the CLI tests.
 
-    Tests that exercise the scanner integration opt in with ``@pytest.mark.external_tools``.
+    PipelineConfig runs no scanners unless asked, so only the CLI default needs pinning. Tests that
+    exercise the scanner integration opt in with ``@pytest.mark.external_tools``.
     """
     if "external_tools" in request.keywords:
         return
-    monkeypatch.setattr("ai_security_review.pipeline.DEFAULT_TOOLS", ())
+    monkeypatch.setattr("ai_security_review.cli.DEFAULT_TOOLS", ())
 
 
 @pytest.fixture
