@@ -36,10 +36,15 @@ See `examples/custom-instructions/` for starting points. Good uses:
 
 ## Scanners
 
-`--tools gitleaks,semgrep` (the default) runs the open-source scanners that are installed; `--tools none`
-disables them. gitleaks findings are reported directly. Semgrep hits are handed to the owning scan as
-candidates, and only reported once confirmed or when the rule's own confidence clears `--min-confidence`.
-Details, including how `.gitleaksignore` and custom rulesets are honoured, are in [tools.md](tools.md).
+`--tools gitleaks,semgrep` (the CLI default, also settable with `AI_SECURITY_REVIEW_TOOLS`) runs the
+open-source scanners that are installed; `--tools none` disables them. The GitHub Action defaults to
+`gitleaks` only, because installing Semgrep adds about a minute to every run; pass `tools: gitleaks,semgrep`
+to opt in. Library callers building a `PipelineConfig` directly get no scanners unless they set `tools`.
+
+gitleaks findings are reported directly. Semgrep hits are handed to the owning scan as candidates and
+reported only once a scan confirms them; an unverified candidate is capped below the default
+`--min-confidence`. Details, including how `.gitleaksignore` and custom rulesets are honoured, are in
+[tools.md](tools.md).
 
 ## Filtering
 

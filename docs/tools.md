@@ -24,8 +24,8 @@ not installed is `skipped`; one that crashes or times out is `failed`. Neither s
 
 ## gitleaks
 
-The touched files are copied into a temporary tree and scanned with `gitleaks dir`. Two kinds of finding
-come out:
+The touched files are copied into a temporary tree and scanned with `gitleaks dir`, which needs gitleaks
+8.19 or newer (the action installs 8.30.1). Two kinds of finding come out:
 
 - **`hardcoded_secret`** (HIGH, confidence 0.85): a rule matched on a line this change added.
 - **`secret_in_history`** (MEDIUM, confidence 0.8): a rule matched on a line this change *removed*.
@@ -44,8 +44,10 @@ The repository's own `.gitleaks.toml` and `.gitleaksignore` are honoured. Finger
 ## Semgrep
 
 Semgrep runs with `--metrics=off` on the touched files using the ruleset in `--semgrep-config`
-(default `p/default`; `AI_SECURITY_REVIEW_SEMGREP_CONFIG` also works). Registry rulesets need network
-access to download. Avoid `auto`, which sends project metadata to semgrep.dev. If `opengrep` is on the
+(default `p/default`; `AI_SECURITY_REVIEW_SEMGREP_CONFIG` also works). Registry rulesets (`p/...`)
+are downloaded from semgrep.dev on every run, so an offline or egress-restricted runner reports the tool
+as `failed`; point `--semgrep-config` at a rules file or directory in the repository to run without
+network access. Avoid `auto`, which sends project metadata to semgrep.dev. If `opengrep` is on the
 PATH and `semgrep` is not, it is used with the same flags.
 
 Each security-category hit on an added line becomes a candidate:
@@ -64,11 +66,14 @@ Each security-category hit on an added line becomes a candidate:
    `confirmed`, `dismissed`, or `unsure` with a reason. A confirmed candidate is reported at confidence
    0.85 or the rule's own, whichever is higher, and merged with the model's own write-up of the same
    line if there is one. A dismissed candidate is listed in the filter summary with the model's reason.
-   An unsure or unverified candidate is reported only if the rule confidence alone clears
-   `--min-confidence`.
+   An unsure or unverified candidate (the owning scan was unsure, failed, or was not run) is capped at
+   confidence 0.6, below the default `--min-confidence` of 0.7, so a pattern match is never posted on
+   its own. Lowering `--min-confidence` to 0.6 is the explicit way to see them. With `--scans`, forced
+   means forced: candidates whose owner was not forced are listed in the filter summary and not sent
+   to any scan.
 
-Classes the review never reports (denial of service, ReDoS, resource leaks) are dropped at the tool
-level by CWE, before they cost any tokens.
+Classes the review never reports (denial of service, ReDoS, resource leaks, open redirects) are dropped
+at the tool level by CWE, before they cost any tokens.
 
 Licensing note: the Semgrep engine is LGPL, but many registry rules are published under the Semgrep
 Rules License, which restricts their use in competing commercial products. Running them in CI on your

@@ -44,9 +44,9 @@ CLAUDE_CODE_ALLOWED_TOOLS = "Read,Glob,Grep,LS,Bash(git diff:*),Bash(git log:*),
 TOOL_GITLEAKS = "gitleaks"
 TOOL_SEMGREP = "semgrep"
 ALL_TOOLS = (TOOL_GITLEAKS, TOOL_SEMGREP)
-DEFAULT_TOOLS = tuple(
-    t.strip().lower() for t in (os.environ.get("AI_SECURITY_REVIEW_TOOLS") or "gitleaks,semgrep").split(",") if t.strip()
-)
+# Scanners the CLI runs when neither --tools nor AI_SECURITY_REVIEW_TOOLS is given. The env var is
+# parsed in exactly one place (cli._parse_tool_list); library callers opt in through PipelineConfig.tools.
+DEFAULT_TOOLS = (TOOL_GITLEAKS, TOOL_SEMGREP)
 TOOL_TIMEOUT_SECONDS = int(os.environ.get("AI_SECURITY_REVIEW_TOOL_TIMEOUT", "300"))
 SEMGREP_CONFIG = os.environ.get("AI_SECURITY_REVIEW_SEMGREP_CONFIG") or "p/default"
 GITLEAKS_CONFIG = os.environ.get("AI_SECURITY_REVIEW_GITLEAKS_CONFIG") or None
@@ -56,6 +56,13 @@ SECRET_FINDING_CONFIDENCE = 0.85
 SECRET_IN_HISTORY_CONFIDENCE = 0.8
 # Confidence a SAST candidate receives once a scan confirms it.
 CONFIRMED_CANDIDATE_CONFIDENCE = 0.85
+# Ceiling for a candidate no scan confirmed (owner scan unsure, failed, or never ran). Kept below the
+# default finding threshold so a pattern match is never reported on its own.
+UNVERIFIED_CANDIDATE_MAX_CONFIDENCE = 0.6
+
+# Categories whose findings carry literal credentials: never echo their source into prompts or
+# comments, and never drop them just because they sit in a documentation file.
+SECRET_CATEGORIES = frozenset({"hardcoded_secret", "secret_in_history"})
 
 # Size limits
 MAX_DIFF_CHARS = 400_000         # above this the diff is truncated per file for the API backend

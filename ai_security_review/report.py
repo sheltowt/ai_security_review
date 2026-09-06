@@ -23,7 +23,7 @@ def finding_comment_body(f: Dict[str, Any]) -> str:
         lines += ["", f"**Exploit scenario:** {f['exploit_scenario']}"]
     if f.get("recommendation"):
         lines += ["", f"**Recommendation:** {f['recommendation']}"]
-    if not f.get("introduced_by_change", True) and f.get("category") != "secret_in_history":
+    if not f.get("introduced_by_change", True):
         lines += ["", "_Pre-existing code made newly reachable by this change._"]
     return "\n".join(lines)
 

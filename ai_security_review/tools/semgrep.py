@@ -3,7 +3,7 @@
 Semgrep runs on the touched files with a security ruleset and every hit that overlaps an added line
 becomes a *candidate*: the review does not trust a pattern match on its own. Each candidate is mapped
 to a finding category through its CWE, handed to the scan that owns that category, and reported only
-when the model confirms it, or when the rule's own confidence is high and no scan looked at it.
+when the model confirms it. A candidate no scan confirmed is capped below the reporting threshold.
 
 Rule metadata drives the initial confidence: Semgrep marks most registry rules LOW confidence and
 ``audit`` subcategory, which is exactly the kind of hit that benefits from a model tracing the flow.
@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ai_security_review.constants import SEMGREP_CONFIG, TOOL_SEMGREP, TOOL_TIMEOUT_SECONDS
+from ai_security_review.constants import SECRET_CATEGORIES, SEMGREP_CONFIG, TOOL_SEMGREP, TOOL_TIMEOUT_SECONDS
 from ai_security_review.diff import DiffBundle
 from ai_security_review.tools.base import Tool, ToolError, ToolResult, read_snippet
 from ai_security_review.tools.categories import category_for_cwes, is_suppressed, owner_scan
@@ -21,8 +21,6 @@ from ai_security_review.tools.categories import category_for_cwes, is_suppressed
 _SEVERITY = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
 _CONFIDENCE = {"HIGH": 0.8, "MEDIUM": 0.65, "LOW": 0.5}
 _DEFAULT_CONFIDENCE = 0.55
-# Categories whose matched source must not be echoed into prompts or comments.
-_NO_SNIPPET = {"hardcoded_secret", "secret_in_history"}
 _MAX_CANDIDATES = 40
 _ACRONYMS = {"sql", "nosql", "xss", "xxe", "csrf", "ssrf", "jwt", "ldap", "xpath", "iv", "cors", "iam", "rbac", "pii", "mfa", "sso", "oauth", "dom", "url", "html", "http"}
 
@@ -155,6 +153,6 @@ class SemgrepTool(Tool):
             "owner_scan": owner_scan(category),
             "end_line": end,
             "cwe": [str(c) for c in (meta.get("cwe") if isinstance(meta.get("cwe"), list) else [meta.get("cwe")]) if c],
-            "snippet": "" if category in _NO_SNIPPET else read_snippet(repo_dir, path, start, end),
+            "snippet": "" if category in SECRET_CATEGORIES else read_snippet(repo_dir, path, start, end),
         })
         return finding

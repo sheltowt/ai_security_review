@@ -29,6 +29,15 @@ class TriageResult:
     selected_scans: List[str] = field(default_factory=list)
     skipped: bool = False                  # True when triage was bypassed (forced scans / --skip-triage)
 
+    def ensure_selected(self, key: str, reason_suffix: str) -> bool:
+        """Add ``key`` to the selected scans (once), noting why in that scan's triage reason."""
+        if key in self.selected_scans:
+            return False
+        self.selected_scans.append(key)
+        entry = self.scans.setdefault(key, {"relevant": False, "confidence": 0.0, "reason": "", "focus": []})
+        entry["reason"] = f"{entry.get('reason') or ''} ({reason_suffix})".strip()
+        return True
+
     def to_dict(self) -> Dict:
         return {
             "summary": self.summary,

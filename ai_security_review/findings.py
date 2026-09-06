@@ -4,7 +4,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Pattern, Tuple
 
-from ai_security_review.constants import CONFIRMED_CANDIDATE_CONFIDENCE, DEFAULT_MIN_FINDING_CONFIDENCE, SEVERITIES
+from ai_security_review.constants import (
+    CONFIRMED_CANDIDATE_CONFIDENCE,
+    DEFAULT_MIN_FINDING_CONFIDENCE,
+    SECRET_CATEGORIES,
+    SEVERITIES,
+    UNVERIFIED_CANDIDATE_MAX_CONFIDENCE,
+)
 from ai_security_review.diff import DiffBundle, ExclusionRules
 from ai_security_review.logger import get_logger
 
@@ -24,13 +30,10 @@ class HardExclusionRules:
     _MEMORY_SAFETY = re.compile(r"\b(buffer overflow|out[- ]of[- ]bounds|use[- ]after[- ]free|double[- ]free|null pointer dereference|memory corruption|integer overflow)\b", re.I)
     _MEMORY_UNSAFE_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".rs", ".zig", ".asm", ".s"}
 
-    # A literal secret is a leak wherever it lands, documentation included.
-    _DOC_EXEMPT_CATEGORIES = {"hardcoded_secret", "secret_in_history"}
-
     @classmethod
     def exclusion_reason(cls, finding: Dict[str, Any]) -> Optional[str]:
         path = str(finding.get("file") or "")
-        if path.lower().endswith((".md", ".rst", ".txt", ".adoc")) and finding.get("category") not in cls._DOC_EXEMPT_CATEGORIES:
+        if path.lower().endswith((".md", ".rst", ".txt", ".adoc")) and finding.get("category") not in SECRET_CATEGORIES:  # a literal secret is a leak wherever it lands
             return "Finding in documentation file"
         text = " ".join(str(finding.get(k) or "") for k in ("title", "category", "description")).lower()
         for reason, pattern in cls._PATTERNS:
@@ -57,7 +60,7 @@ class FilterSummary:
     candidates_total: int = 0
     candidates_confirmed: int = 0
     candidates_dismissed: int = 0
-    candidates_unverified: int = 0       # no scan gave a verdict; kept only if the rule confidence was high enough
+    candidates_unverified: int = 0       # no scan confirmed or dismissed it; capped below the default threshold
     excluded_details: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -126,11 +129,17 @@ def _tokens(text: str) -> set:
     return {t for t in re.findall(r"[a-z0-9_]+", text.lower()) if t not in _STOPWORDS and len(t) > 2}
 
 
+DUPLICATE_LINE_WINDOW = 3
+
+
+def _same_spot(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Same file, within the dedupe line window."""
+    return a["file"] == b["file"] and abs(int(a["line"]) - int(b["line"])) <= DUPLICATE_LINE_WINDOW
+
+
 def _similar(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     """Two findings are duplicates when they hit the same file within a few lines and talk about the same thing."""
-    if a["file"] != b["file"]:
-        return False
-    if abs(a["line"] - b["line"]) > 3:
+    if not _same_spot(a, b):
         return False
     if a["category"] == b["category"]:
         return True
@@ -167,49 +176,78 @@ def merge_duplicates(findings: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any
     return merged, merged_count
 
 
-def similar_findings(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
-    """Public wrapper around the duplicate test, for callers outside this module."""
-    return _similar(a, b)
+def collapse_candidates(candidates: List[Dict[str, Any]], tool_findings: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """Drop candidates a scanner already reports outright, and fold several rules on one line into one candidate.
+
+    "Already reported" uses the full dedupe test. Folding uses only file, category, and the shared
+    line window: scanner descriptions are templated, so the text-similarity branch of ``_similar``
+    would merge unrelated rules. Returns ``(candidates, dropped_count)``; ids are reassigned so they
+    stay dense and stable.
+    """
+    reported = [normalize_finding(f) for f in tool_findings]
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    for c in candidates:
+        if any(_similar(normalize_finding(c), r) for r in reported):
+            dropped += 1
+            continue
+        twin = next((k for k in kept if k["category"] == c["category"] and _same_spot(k, c)), None)
+        if twin is None:
+            kept.append(dict(c))
+            continue
+        dropped += 1
+        twin["rule_id"] = f"{twin['rule_id']}, {c['rule_id']}"
+        twin["confidence"] = max(twin["confidence"], c["confidence"])
+        if c.get("description") and c["description"] not in twin.get("description", ""):
+            twin["description"] = f"{twin.get('description', '')} Also matched by '{c['rule_id']}'."
+    for i, c in enumerate(kept, 1):
+        c["id"] = f"{c.get('tool', 'tool')}-{i}"
+    return kept, dropped
 
 
 def resolve_candidates(
     candidates: List[Dict[str, Any]],
     verdicts: Dict[str, Dict[str, Any]],
-    min_confidence: float = DEFAULT_MIN_FINDING_CONFIDENCE,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
     """Turn scanner candidates into findings using the scans' verdicts.
 
-    Returns ``(promoted, excluded_details, counts)``. Confirmed candidates are promoted with the
-    model's reason attached; dismissed ones are excluded with that reason; the rest pass through on
-    their own rule confidence, so only high-confidence rules report without a model looking at them.
+    Returns ``(findings, excluded_details, counts)``. This function only decides *confidence*; the
+    single reporting threshold is applied later by :func:`process_findings`.
+
+    - confirmed:  promoted at least to ``CONFIRMED_CANDIDATE_CONFIDENCE`` with the scan's reason attached.
+    - dismissed:  excluded with the scan's reason.
+    - unverified: the owner scan was unsure, failed, or never ran. The rule's own confidence is capped
+      at ``UNVERIFIED_CANDIDATE_MAX_CONFIDENCE`` (below the default threshold) so a pattern match is
+      never reported on its own; lowering ``--min-confidence`` is the explicit way to see them.
     """
-    promoted: List[Dict[str, Any]] = []
+    findings: List[Dict[str, Any]] = []
     excluded: List[Dict[str, Any]] = []
     counts = {"total": len(candidates), "confirmed": 0, "dismissed": 0, "unverified": 0}
     for c in candidates:
         v = verdicts.get(str(c.get("id")))
         f = {k: val for k, val in c.items() if k not in ("id", "owner_scan", "snippet", "end_line")}
         f["scans"] = [c.get("tool") or c.get("scan") or "tool"]
-        if v and v.get("verdict") == "confirmed":
+        verdict = (v or {}).get("verdict")
+        if verdict == "confirmed":
             counts["confirmed"] += 1
             f["confidence"] = max(float(f.get("confidence") or 0), CONFIRMED_CANDIDATE_CONFIDENCE)
             f["scans"].append(v["scan"])
             if v.get("reason"):
                 f["description"] = f"{f.get('description', '')} Confirmed by the {v['scan']} scan: {v['reason']}".strip()
-            promoted.append(f)
-        elif v and v.get("verdict") == "dismissed":
+            findings.append(f)
+        elif verdict == "dismissed":
             counts["dismissed"] += 1
             excluded.append({**normalize_finding(f), "excluded_reason": f"Dismissed by the {v['scan']} scan: {v.get('reason') or 'no reason given'}"})
         else:
             counts["unverified"] += 1
+            f["confidence"] = min(float(f.get("confidence") or 0), UNVERIFIED_CANDIDATE_MAX_CONFIDENCE)
             if v and v.get("reason"):
-                f["description"] = f"{f.get('description', '')} The {v['scan']} scan could not confirm or rule this out: {v['reason']}".strip()
-            if float(f.get("confidence") or 0) >= min_confidence:
-                promoted.append(f)
+                why = f"The {v['scan']} scan could not confirm or rule this out: {v['reason']}"
             else:
-                why = "no scan verified it" if not v else f"the {v['scan']} scan was unsure"
-                excluded.append({**normalize_finding(f), "excluded_reason": f"Scanner candidate below confidence threshold and {why}"})
-    return promoted, excluded, counts
+                why = "No scan verified this scanner candidate."
+            f["description"] = f"{f.get('description', '')} {why}".strip()
+            findings.append(f)
+    return findings, excluded, counts
 
 
 def process_findings(

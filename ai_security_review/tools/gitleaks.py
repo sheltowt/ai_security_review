@@ -124,7 +124,7 @@ class GitleaksTool(Tool):
             if f.path not in copied:
                 copied.append(f.path)
         # Honour the repository's own gitleaks configuration. Fingerprints in .gitleaksignore are
-        # path-based, so each is duplicated with the staging prefix so it still matches here.
+        # path-based, so each is duplicated with both staging prefixes so it still matches here.
         toml = repo_dir / ".gitleaks.toml"
         if toml.is_file():
             shutil.copyfile(toml, root / ".gitleaks.toml")
@@ -136,6 +136,7 @@ class GitleaksTool(Tool):
                 lines.append(raw)
                 if entry and not entry.startswith("#"):
                     lines.append(f"{_ADDED_ROOT}/{entry}")
+                    lines.append(f"{_REMOVED_ROOT}/{entry}")
             (root / ".gitleaksignore").write_text("\n".join(lines) + "\n", encoding="utf-8")
         return copied
 
@@ -199,5 +200,4 @@ class GitleaksTool(Tool):
             exploit_scenario="Anyone who can read the repository history can recover the credential from the earlier commit.",
             recommendation="Rotate the credential. If the history must be scrubbed as well, rewrite it with git filter-repo and force-push, then invalidate forks and caches.",
             confidence=SECRET_IN_HISTORY_CONFIDENCE,
-            introduced_by_change=False,
         )
